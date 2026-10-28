@@ -3,9 +3,13 @@ import math
 
 def number(v):return isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
 def rounded(v):return math.floor(v*10+.5)/10
+def sequential_sum(values):
+    total=0.0
+    for value in values:total+=value
+    return total
 def aggregate(rows,total):
     eligible=[s for s in rows if number(s.get('movent'))]
-    def mean(values):return rounded(sum(values)/len(values)) if values else None
+    def mean(values):return rounded(sequential_sum(values)/len(values)) if values else None
     def comparison(key):
         paired=[s for s in eligible if s.get('quality')!='sensitive' and number(s.get(key))]
         complete=bool(paired) and len(paired)==len(eligible)
@@ -29,7 +33,7 @@ def publish(feed,root,write):
         def leading(groups):return max((g for g in groups if g['movent'] is not None),key=lambda g:g['movent'],default=None)
         path='data/countries/'+code+'.json'
         manifest['countries'][code]={k:country[k] for k in ['asOf','releaseStatus','schedule','currency','sampleKind','coverageNote','indices']}
-        manifest['countries'][code].update(path=path,revision=feed['generatedAt'],stocks=len(rows),tracked=len(country['tracked']),overview={**aggregate(rows,len(country['tracked'])),'leadingMarket':leading(markets),'leadingSector':leading(sectors)})
+        manifest['countries'][code].update(path=path,revision=feed['generatedAt'],stocks=len(rows),tracked=len(country['tracked']),overview={**aggregate(rows,len(country['tracked'])),'leadingMarket':leading(markets),'leadingSector':leading([g for g in sectors if g['name']!='업종 미분류'])})
         write(root/path,{'version':'movent-country/1','countryCode':code,'revision':feed['generatedAt'],'data':country})
         for tracked in country['tracked']:
             s=by_ticker.get(tracked['ticker'])
