@@ -1,0 +1,53 @@
+name: Update MOVENT markets
+on:
+  schedule:
+    # Korea time 08:47 (after US close and BVT), 19:47 (after Asian closes).
+    - cron: '47 23 * * *'
+    - cron: '47 10 * * *'
+  workflow_dispatch: {}
+  push:
+    paths: ['scripts/**', 'config.json', 'requirements.txt', 'tests/**', '.github/workflows/update.yml', 'bootstrap.py']
+permissions:
+  contents: write
+concurrency:
+  group: movent-market-data
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare initial source files
+        run: python bootstrap.py
+      - name: Install exchange calendars
+        run: pip install -r requirements.txt
+      - name: Test calculation and preservation rules
+        run: python -m unittest discover -s tests -v
+      - name: Read BVT source
+        uses: actions/checkout@v4
+        with:
+          repository: bemorebb66-stack/bmo-moneyflow
+          path: work/bvt
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Collect and validate completed sessions
+        run: python scripts/update.py
+      - name: Publish validated feed
+        run: |
+          git config user.name 'movent-data-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add data/global.json data/status.json config.json requirements.txt scripts tests .gitignore README.md
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "data: refresh MOVENT markets $(date -u +%F)"
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - name: Publish run summary
+        if: always()
+        run: |
+          if [ -f data/status.json ]; then
+            python -c 'import json,os; d=json.load(open("data/status.json")); f=open(os.environ["GITHUB_STEP_SUMMARY"],"a"); f.write("## MOVENT refresh\n\n"); f.write("```json\n"+json.dumps(d,ensure_ascii=False,indent=2)+"\n```\n")'
+          fi
