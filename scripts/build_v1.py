@@ -39,7 +39,7 @@ def build(root,source):
     for t,r in current.items():
         meta=snapshots[-1][t];ind=meta.get("industry") or "Unknown";sec=meta.get("sector") or "Unknown"
         rows=series[t];n,observed,streak=context(rows,len(dates)-1)
-        history=[{"date":dates[i],"movent":round(row["score"],1),"price":snapshots[i].get(t,{}).get("close_price"),"estimated":row["estimated"]} for i,row in enumerate(rows) if row][-60:]
+        history=[{"date":dates[i],"movent":round(row["score"],1),"price":snapshots[i].get(t,{}).get("close_price"),"estimated":row["estimated"],**({"anomalous":row["confirmed"]} if not row["estimated"] else {})} for i,row in enumerate(rows) if row][-60:]
         def change(h):
             earlier=rows[-1-h] if len(rows)>h else None
             return round(r["score"]-earlier["score"],1) if earlier and not earlier["estimated"] else None
@@ -60,7 +60,7 @@ def build(root,source):
         sensitivity=round(max([abs(s-r["score"]) for s in sensitivities],default=0),1)
         quality="sensitive" if sensitivity>5 else "estimated_baseline" if r["baselineEstimated"] else "observed"
         stocks.append({"date":dates[-1],"ticker":t,"company":meta.get("name") or t,"sector":sec,"sectorSlug":slugify(sec),"industry":ind,"industrySlug":slugify(ind),
-          "price":meta.get("close_price"),"priceChange":meta.get("daily_return"),"dollarVolume":values[t][-1],"relativeActivity":round(r["ratio"],3),"ratio20":round(values[t][-1]/st.median(values[t][-21:-1]),3),
+          "price":meta.get("close_price"),"priceChange":meta.get("daily_return"),"dollarVolume":values[t][-1],"relativeActivity":round(r["ratio"],3),"ratio20":round(values[t][-1]/st.median(values[t][-21:-1]),3),"medianTurnover20":st.median(values[t][-21:-1]),"medianTurnover20Basis":"input-median",
           "movent":round(r["score"],1),"activity":round(r["score"],1),"robustZ":round(r["z"],4),"baseline":round(r["baseline"],2),
           "anomalous":r["anomalous"],"persistence":round(100*n/observed,1) if observed else 0,"days5":n,"observedDays5":observed,"streak":streak,
           "days20":sum(bool(row and row["confirmed"]) for row in rows[-20:]),"history":history,"change1d":change(1),"change5d":change(5),"change20d":change(20),
