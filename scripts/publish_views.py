@@ -19,6 +19,22 @@ def aggregate(rows,total):
 def phase(s):
     if s['anomalous']:return '반복 발생' if s['days5']>=3 and s['observedDays5']==5 else '이례적 활동'
     return '활동 진정' if s['days5']>=2 else '일반 활동'
+def occurrence_changes(country):
+    import datetime as dt
+    schedule=country.get('schedule',{});previous=None
+    day=dt.date.fromisoformat(country['asOf'])
+    for _ in range(14):
+        day-=dt.timedelta(days=1);key=day.isoformat()
+        if not schedule.get('validFrom','9999')<=key<=schedule.get('validThrough','0000'):break
+        if day.weekday()<5 and key not in schedule.get('holidays',[]):previous=key;break
+    counts={k:0 for k in ['new','continuing','ended','none','insufficient']}
+    for stock in country['stocks']:
+        prior=next((p for p in stock['history'] if p['date']==previous),None)
+        if not prior or type(prior.get('anomalous')) is not bool or prior.get('estimated') or stock.get('quality')=='sensitive':counts['insufficient']+=1;continue
+        key=('continuing' if prior['anomalous'] else 'new') if stock['anomalous'] else ('ended' if prior['anomalous'] else 'none')
+        counts[key]+=1
+    return {**counts,'asOf':country['asOf'],'previousDate':previous,'total':len(country['stocks'])}
+
 def publish(feed,root,write):
     manifest={'version':'movent-manifest/1','generatedAt':feed['generatedAt'],'countries':{},'search':[]}
     for code,country in feed['countries'].items():
@@ -33,8 +49,9 @@ def publish(feed,root,write):
         def leading(groups):return max((g for g in groups if g['movent'] is not None),key=lambda g:g['movent'],default=None)
         path='data/countries/'+code+'.json'
         manifest['countries'][code]={k:country[k] for k in ['asOf','releaseStatus','schedule','currency','sampleKind','coverageNote','indices']}
-        manifest['countries'][code].update(path=path,revision=feed['generatedAt'],stocks=len(rows),tracked=len(country['tracked']),overview={**aggregate(rows,len(country['tracked'])),'leadingMarket':leading(markets),'leadingSector':leading([g for g in sectors if g['name']!='업종 미분류'])})
-        write(root/path,{'version':'movent-country/1','countryCode':code,'revision':feed['generatedAt'],'data':country})
+        if country.get('lastSuccessAt'):manifest['countries'][code]['lastSuccessAt']=country['lastSuccessAt']
+        manifest['countries'][code].update(path=path,revision=country.get('sourceRevision',feed['generatedAt']),stocks=len(rows),tracked=len(country['tracked']),changes=occurrence_changes(country),overview={**aggregate(rows,len(country['tracked'])),'leadingMarket':leading(markets),'leadingSector':leading([g for g in sectors if g['name']!='업종 미분류'])})
+        write(root/path,{'version':'movent-country/1','countryCode':code,'revision':country.get('sourceRevision',feed['generatedAt']),'data':country})
         for tracked in country['tracked']:
             s=by_ticker.get(tracked['ticker'])
             manifest['search'].append({'ticker':tracked['ticker'],'company':s['company'] if s else tracked['company'],'companyEn':s.get('companyEn',tracked['company']) if s else tracked.get('companyEn',tracked['company']),'countryCode':code,'movent':s['movent'] if s else None,'change5d':s.get('change5d') if s else None,'percentile':None,'phase':phase(s) if s else None,'available':bool(s),'status':'eligible' if s else tracked['status'],'reason':None if s else tracked.get('reason')})
