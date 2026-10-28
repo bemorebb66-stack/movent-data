@@ -9,9 +9,11 @@ import html
 import io
 import json
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 import pandas as pd
 
@@ -32,7 +34,12 @@ JP_SECTORS={'水産・農林業':'필수소비재','鉱業':'에너지','建設�
 TW_INDUSTRIES={'01':('소재','시멘트'),'02':('필수소비재','식품'),'03':('소재','플라스틱'),'04':('소재','섬유'),'05':('산업재','전기·기계'),'06':('정보기술','전선·케이블'),'08':('소재','유리·세라믹'),'09':('소재','제지'),'10':('소재','철강'),'11':('소재','고무'),'12':('경기소비재','자동차'),'14':('산업재','건설'),'15':('산업재','운송'),'16':('경기소비재','관광'),'17':('금융','금융·보험'),'18':('경기소비재','무역·유통'),'20':('기타','기타'),'21':('소재','화학'),'22':('헬스케어','바이오·의료'),'23':('에너지','석유·가스'),'24':('정보기술','반도체'),'25':('정보기술','컴퓨터·주변기기'),'26':('정보기술','광전자'),'27':('통신서비스','통신·네트워크'),'28':('정보기술','전자부품'),'29':('정보기술','전자유통'),'30':('정보기술','정보서비스'),'31':('정보기술','기타 전자'),'35':('에너지','친환경 에너지'),'36':('통신서비스','디지털 콘텐츠'),'37':('경기소비재','스포츠·레저'),'38':('산업재','생활 서비스'),'91':('기타','외국예탁증서')}
 
 def download(url):
-    with urlopen(Request(url,headers={'User-Agent':'Mozilla/5.0 MOVENT/1.0'}),timeout=35) as response:return response.read()
+    for attempt in range(3):
+        try:
+            with urlopen(Request(url,headers={'User-Agent':'Mozilla/5.0 MOVENT/1.0'}),timeout=35) as response:return response.read()
+        except HTTPError as error:
+            if error.code not in (429,500,502,503,504) or attempt==2:raise
+            time.sleep(min(15,max(2,int(error.headers.get('Retry-After','2')))))
 def text(value):return html.unescape(re.sub(r'<[^>]+>','',str(value))).strip()
 def domain(value):
     value=str(value or '').strip()
