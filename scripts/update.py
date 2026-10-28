@@ -16,30 +16,52 @@ import tempfile
 import time
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 from html.parser import HTMLParser
 import re
-from model_v1 import sequence, context
+import gzip
+import threading
+from model_v1 import sequence, context, MIN_LIQUIDITY
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = json.loads((ROOT / 'config.json').read_text())['markets']
+_rate_lock=threading.Lock()
+_next_request=0.0
+
+def limit_requests():
+    global _next_request
+    with _rate_lock:
+        now=time.monotonic();slot=max(now,_next_request);_next_request=slot+.25
+    if slot>now:time.sleep(slot-now)
 
 def read_json(url):
     last = None
     for attempt in range(3):
         try:
-            with urlopen(Request(url, headers={'User-Agent':'Mozilla/5.0 MOVENT/1.0'}), timeout=30) as r:
+            limit_requests()
+            with urlopen(Request(url, headers={'User-Agent':'Mozilla/5.0 MOVENT/1.0'}), timeout=18) as r:
                 return json.load(r)
         except Exception as e:
             last = e
+            if isinstance(e,HTTPError) and e.code in (400,404,410):raise
             if attempt < 2: time.sleep(2 * (attempt + 1))
     raise last
 
 def chart(symbol):
     if symbol == '^TOPX': return topix_chart()
-    data = read_json('https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='') + '?range=1y&interval=1d')
+    path=ROOT/'work'/'chart-cache'/(quote(symbol,safe='')+'.json.gz')
+    try:
+        if time.time()-path.stat().st_mtime<1800:
+            with gzip.open(path,'rt',encoding='utf-8') as f:return json.load(f)
+    except (OSError,ValueError,EOFError):pass
+    data = read_json('https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='') + '?range=6mo&interval=1d')
     result = data.get('chart', {}).get('result')
     if not result: raise ValueError('No chart: ' + symbol)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temporary=path.with_suffix('.tmp')
+    with gzip.open(temporary,'wt',encoding='utf-8') as f:json.dump(result[0],f,separators=(',',':'))
+    os.replace(temporary,path)
     return result[0]
 
 def topix_chart():
@@ -133,6 +155,17 @@ def validate_country(data, old=None):
         if not 0<=s['days5']<=s['observedDays5']<=5:raise ValueError('Invalid persistence')
     return data
 
+def unavailable_reason(bars,dates,currency):
+    current=bars.get(dates[-1])
+    if not current or not current.get('volume'):
+        return '기준 거래일의 확정 종가 또는 유효 거래량이 없습니다.'
+    baseline=[bars[d]['close']*bars[d]['volume'] for d in dates[-61:-1] if d in bars and bars[d].get('volume')]
+    if len(baseline)<60:
+        return f'직전 연속 60거래일의 유효 거래대금 관측이 부족합니다 ({len(baseline)}/60일).'
+    if st.median(baseline)<MIN_LIQUIDITY:
+        return f'직전 60거래일 중앙 거래대금이 최소 조건 {MIN_LIQUIDITY:,.0f} {currency} 미만입니다.'
+    return '가격·거래량 관측값이 계산 검증을 통과하지 못했습니다.'
+
 def foreign_country(code, cfg, fetched, now, previous):
     # The broad market index supplies an independent local session grid.
     reference=parse_bars(fetched[cfg['indices'][0][2]], cfg, now)
@@ -140,24 +173,32 @@ def foreign_country(code, cfg, fetched, now, previous):
     if len(dates)<81:raise ValueError('Insufficient reference sessions')
     stocks=[];tracked=[]
     for meta in cfg['stocks']:
-        ticker=meta[0];row=None
-        try:
-            row=stock_row(meta,parse_bars(fetched[ticker],cfg,now),dates,code,cfg)
-        except Exception:pass
-        tracked.append({'ticker':ticker,'company':meta[1],'companyEn':ticker,'sector':meta[2],'industry':meta[3],'status':'eligible' if row else 'data_unavailable','reason':None if row else '연속 60거래일 관측·유동성 조건 부족 또는 수집 실패'})
+        ticker=meta[0];row=None;reason='시세 공급원에서 가격·거래량 이력을 가져오지 못했습니다. 다음 수집 때 다시 확인합니다.'
+        if ticker in fetched:
+            try:
+                bars=parse_bars(fetched[ticker],cfg,now)
+                reason=unavailable_reason(bars,dates,cfg['currency'])
+                row=stock_row(meta,bars,dates,code,cfg)
+            except Exception:reason='현지 통화·거래일 또는 가격·거래량 검증을 통과하지 못했습니다.'
+        tracked.append({'ticker':ticker,'company':meta[1],'companyEn':ticker,'sector':meta[2],'industry':meta[3],'status':'eligible' if row else 'data_unavailable','reason':None if row else reason})
         if row:stocks.append(row)
-    if len(stocks)<max(5,math.ceil(.75*len(cfg['stocks']))):raise ValueError('Less than 75% of configured sample')
+    if len(stocks)<5:raise ValueError('Fewer than five validated observations')
+    industries={};sectors={}
+    for s in stocks:
+        industries.setdefault(s['industry'],[]).append(s)
+        sectors.setdefault(s['sector'],[]).append(s)
     for stock in stocks:
-        peers=[s for s in stocks if s['industry']==stock['industry'] and s['ticker']!=stock['ticker']]
-        if len(peers)<5:
-            peers=[s for s in stocks if s['sector']==stock['sector'] and s['ticker']!=stock['ticker']]
+        peers=industries.get(stock['industry'],[]) if stock['industry']!='업종 미분류' else []
+        if len(peers)<6:
+            peers=sectors.get(stock['sector'],[]) if stock['sector']!='업종 미분류' else []
             stock['breadthSource']='sector_fallback'
+        peers=[s for s in peers if s['ticker']!=stock['ticker']]
         stock.update(breadthTotal=len(peers),breadthCount=sum(s['anomalous'] for s in peers),breadthAvailable=len(peers)>=5)
         stock['breadth']=round(100*stock['breadthCount']/len(peers),1) if peers else 0
-    groups=lambda key:[{'slug':s[key+'Slug'],'name':s[key]} for i,s in enumerate(stocks) if s[key] not in {p[key] for p in stocks[:i]}]
-    data={'asOf':dates[-1],'releaseStatus':'final','schedule':schedule(cfg,now),'currency':cfg['currency'],'sampleKind':'representative-sample','methodVersion':'v1.0','stocks':stocks,'tracked':tracked,
+    groups=lambda key:list({s[key]:{'slug':s[key+'Slug'],'name':s[key]} for s in stocks}.values())
+    data={'asOf':dates[-1],'releaseStatus':'final','schedule':schedule(cfg,now),'currency':cfg['currency'],'sampleKind':cfg.get('sampleKind','representative-sample'),'methodVersion':'v1.0','stocks':stocks,'tracked':tracked,
           'markets':market_groups(code,cfg,stocks), 'sectors':groups('sector'),'industries':groups('industry'),'indices':index_quotes(cfg,fetched,now),
-          'coverageNote':'선정한 대표 종목의 추적 표본입니다. 국가 전체나 지수 전체 구성종목을 포괄하지 않습니다. 공식 지수 시세와 MOVENT 표본 점수는 별개입니다.'}
+          'coverageNote':'공개 지수 구성목록과 거래소 상장기업을 기반으로 확장한 추적 유니버스입니다. 지수별 구성 확인일과 출처를 표시하며 ETF 보유종목은 추종 표본으로 구분합니다. 모든 상장종목 또는 모든 지수 구성종목의 수집을 보장하지 않습니다.'}
     return validate_country(data,previous)
 
 def market_groups(code,cfg,stocks):
@@ -165,9 +206,12 @@ def market_groups(code,cfg,stocks):
     groups=[]
     for slug,group in definitions.items():
         if group['countryCode']!=code:continue
-        tracked=[s[0] for s in cfg['stocks'] if s[0] in group.get('members',[]) or group.get('suffix') and s[0].endswith(group['suffix'])]
+        member_set=set(group.get('members',[]))
+        tracked=[s[0] for s in cfg['stocks'] if s[0] in member_set or group.get('suffix') and s[0].endswith(group['suffix'])]
         constituents=[s['ticker'] for s in stocks if s['ticker'] in tracked]
         if not constituents:continue
+        for stock in stocks:
+            if stock['ticker'] in member_set and slug not in stock['indexMemberships']:stock['indexMemberships'].append(slug)
         groups.append({'slug':slug,'name':group['name'],'sourceTotal':group.get('sourceTotal',len(tracked)),'constituents':constituents,'scope':group['scope'],'sourceUrl':group['sourceUrl'],'membershipAsOf':group.get('membershipAsOf')})
     return groups
 
@@ -242,7 +286,10 @@ def atomic_write(path, data):
         if os.path.exists(tmp):os.unlink(tmp)
 
 def main():
+    global CONFIG
     now=dt.datetime.now(dt.timezone.utc)
+    from expand_universe import expand
+    CONFIG=expand(now)['markets']
     path=ROOT/'data/global.json'
     previous=json.loads(path.read_text()) if path.exists() else {'countries':{}}
     symbols={s[0] for cfg in CONFIG.values() for s in cfg['stocks']} | {i[2] for cfg in CONFIG.values() for i in cfg['indices']}
@@ -250,10 +297,16 @@ def main():
     def get(symbol):
         try:return symbol,chart(symbol),None
         except Exception as e:return symbol,None,str(e)
-    with cf.ThreadPoolExecutor(max_workers=4) as pool:
-        for symbol,data,error in pool.map(get,sorted(symbols)):
+    definitions=json.loads((ROOT/'config.json').read_text())
+    priority={i[2] for cfg in CONFIG.values() for i in cfg['indices']}
+    priority.update(t for group in definitions.get('marketGroups',{}).values() if group.get('scope')!='board-sample' for t in group.get('members',[]))
+    ordered=sorted(symbols,key=lambda symbol:(symbol not in priority,symbol))
+    # Concurrency absorbs latency while the shared limiter caps starts at 4/s.
+    with cf.ThreadPoolExecutor(max_workers=48) as pool:
+        for count,(symbol,data,error) in enumerate(pool.map(get,ordered),1):
             if data:fetched[symbol]=data
             else:failures[symbol]=error
+            if count%200==0:print('Collected',count,'/',len(symbols),'symbols;',len(failures),'unavailable',flush=True)
     countries=dict(previous['countries']);errors={}
     for code,cfg in CONFIG.items():
         try:
@@ -273,6 +326,8 @@ def main():
     if not previous['countries'] and set(countries)!=set(CONFIG):raise RuntimeError('Initial release incomplete: '+str(errors))
     current={'version':'movent-global/1','generatedAt':now.isoformat(),'source':'Yahoo Finance EOD / BVT','countries':countries}
     atomic_write(path,current)
+    from publish_views import publish
+    publish(current,ROOT,atomic_write)
     if errors:print('Partial refresh: see data/status.json',flush=True)
 
 if __name__=='__main__':main()
