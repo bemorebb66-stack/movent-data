@@ -134,10 +134,10 @@ def stock_row(meta, bars, dates, code, cfg):
     industry_slug=code.lower()+'-i-'+industry
     return {'date':dates[-1],'ticker':ticker,'company':company,'companyEn':ticker,'sector':sector,'sectorSlug':sector_slug,'industry':industry,'industrySlug':industry_slug,
       'price':bars[dates[-1]]['close'],'priceChange':round(100*(bars[dates[-1]]['close']/bars[dates[-2]]['close']-1),2) if dates[-2] in bars else None,
-      'dollarVolume':values[-1],'relativeActivity':round(row['ratio'],3),'ratio20':round(values[-1]/st.median(values[-21:-1]),3),
+      'dollarVolume':values[-1],'relativeActivity':round(row['ratio'],3),'ratio20':round(values[-1]/st.median(values[-21:-1]),3),'medianTurnover20':st.median(values[-21:-1]),'medianTurnover20Basis':'observed-median',
       'movent':round(row['score'],1),'activity':round(row['score'],1),'robustZ':round(row['z'],4),'baseline':round(row['baseline'],2),'anomalous':row['anomalous'],
       'persistence':round(100*count/observed,1) if observed else 0,'days5':count,'observedDays5':observed,'streak':streak,'days20':sum(bool(r and r['confirmed']) for r in rows[-20:]),
-      'history':[{'date':dates[i],'movent':round(r['score'],1),'price':bars[dates[i]]['close'],'estimated':False} for i,r in enumerate(rows) if r][-60:],
+      'history':[{'date':dates[i],'movent':round(r['score'],1),'price':bars[dates[i]]['close'],'estimated':False,'anomalous':r['confirmed']} for i,r in enumerate(rows) if r][-60:],
       'change1d':change(1),'change5d':change(5),'change20d':change(20),'breadthCount':0,'breadthTotal':0,'breadth':0,'breadthAvailable':False,'breadthSource':'industry',
       'breadthChange5d':None,'baselineEstimated':0,'quality':'observed','sensitivity':0,'industryAvailable':False,'industryRoute':None,'sectorRoute':None,
       'countryCode':code,'currency':cfg['currency'],'exchangeCode':venue,'localCode':ticker.split('.')[0],'instrumentId':f'{code}:{venue}:{ticker}',
@@ -167,6 +167,7 @@ def unavailable_reason(bars,dates,currency):
     return '가격·거래량 관측값이 계산 검증을 통과하지 못했습니다.'
 
 def foreign_country(code, cfg, fetched, now, previous):
+    if len(cfg['stocks'])<cfg.get('minimumTracked',0):raise ValueError('Tracking universe below validated minimum; preserve last good country')
     # The broad market index supplies an independent local session grid.
     reference=parse_bars(fetched[cfg['indices'][0][2]], cfg, now)
     dates=sorted(reference)
@@ -308,10 +309,13 @@ def main():
             else:failures[symbol]=error
             if count%200==0:print('Collected',count,'/',len(symbols),'symbols;',len(failures),'unavailable',flush=True)
     countries=dict(previous['countries']);errors={}
+    for data in countries.values():data.setdefault('sourceRevision',previous.get('generatedAt',now.isoformat()))
     for code,cfg in CONFIG.items():
         try:
             old=countries.get(code)
             countries[code]=us_country(cfg,fetched,now,old) if code=='US' else foreign_country(code,cfg,fetched,now,old)
+            countries[code]['lastSuccessAt']=dt.datetime.now(dt.timezone.utc).isoformat()
+            countries[code]['sourceRevision']=countries[code]['lastSuccessAt']
             if old:
                 prior={q['slug']:q for q in old.get('indices',[])}
                 countries[code]['indices']=[prior[q['slug']] if q['price'] is None and prior.get(q['slug'],{}).get('price') is not None else q for q in countries[code]['indices']]
@@ -319,12 +323,13 @@ def main():
         except Exception as e:
             errors[code]=str(e)
             print(code,'PRESERVED:',e,flush=True)
-    status={'checkedAt':now.isoformat(),'errors':errors,'failedSymbols':failures,'countries':{code:{'asOf':data['asOf'],'stocks':len(data['stocks'])} for code,data in countries.items()}}
+    completed=dt.datetime.now(dt.timezone.utc).isoformat()
+    status={'startedAt':now.isoformat(),'checkedAt':completed,'universeRefresh':definitions.get('universeRefresh',{}),'errors':errors,'failedSymbols':failures,'countries':{code:{'asOf':data['asOf'],'stocks':len(data['stocks'])} for code,data in countries.items()}}
     atomic_write(ROOT/'data/status.json',status)
     if not countries:raise RuntimeError('No valid country. Previous data preserved.')
     # A complete initial release is required; later failures preserve each country's last good data.
     if not previous['countries'] and set(countries)!=set(CONFIG):raise RuntimeError('Initial release incomplete: '+str(errors))
-    current={'version':'movent-global/1','generatedAt':now.isoformat(),'source':'Yahoo Finance EOD / BVT','countries':countries}
+    current={'version':'movent-global/1','generatedAt':completed,'source':'Yahoo Finance EOD / BVT','countries':countries}
     atomic_write(path,current)
     from publish_views import publish
     publish(current,ROOT,atomic_write)
