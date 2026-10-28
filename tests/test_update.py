@@ -31,4 +31,42 @@ class UpdateTests(unittest.TestCase):
     def test_no_date_regression(self):
         with self.assertRaises(ValueError):update.validate_country({'asOf':'2026-10-26','stocks':[{}]*5},{'asOf':'2026-10-27','stocks':[{}]*5})
 
+class ResearchMetadataTests(unittest.TestCase):
+    def test_exact_median_and_historical_flags(self):
+        import statistics
+        dates=[(dt.date(2026,1,1)+dt.timedelta(days=i)).isoformat() for i in range(100)]
+        bars={d:{'close':100,'volume':1000000+i*10000} for i,d in enumerate(dates)}
+        row=update.stock_row(['7203.T','Toyota','Auto','Auto'],bars,dates,'JP',update.CONFIG['JP'])
+        self.assertEqual(row['medianTurnover20'],statistics.median([bars[d]['close']*bars[d]['volume'] for d in dates[-21:-1]]))
+        self.assertEqual(row['medianTurnover20Basis'],'observed-median')
+        self.assertTrue(all(isinstance(p['anomalous'],bool) for p in row['history']))
+        self.assertEqual(row['history'][-1]['anomalous'],row['anomalous'])
+    def test_cached_taiwan_list_can_survive_provider_failure(self):
+        import json
+        from expand_universe import recover_verified_sources
+        members=[[str(1000+i)+'.TW','Test','Test','Test',None] for i in range(800)]
+        baseline={'universeSources':{'taiwan':{'countryCode':'TW','slug':'tw-taiex','name':'TAIEX','sourceUrl':'https://openapi.twse.com.tw/v1/opendata/t187ap03_L','membershipAsOf':'2026-10-27','scope':'board-sample','sourceTotal':800,'members':members}}}
+        config={}
+        self.assertEqual(recover_verified_sources(config,lambda url:json.dumps(baseline).encode()),{})
+        self.assertEqual(len(config['universeSources']['taiwan']['members']),800)
+        self.assertEqual(recover_verified_sources(config,lambda url: (_ for _ in ()).throw(RuntimeError('offline'))),{})
+    def test_taiwan_coverage_floor_fails_before_network(self):
+        with self.assertRaises(ValueError):update.foreign_country('TW',{'stocks':[],'minimumTracked':800},{},dt.datetime.now(dt.timezone.utc),None)
+    def test_new_occurrence_needs_exact_previous_session(self):
+        from publish_views import occurrence_changes
+        country={'asOf':'2026-10-28','schedule':{'validFrom':'2026-01-01','validThrough':'2026-12-31','holidays':[]},'stocks':[{'anomalous':True,'quality':'observed','history':[{'date':'2026-10-27','anomalous':False}]},{'anomalous':True,'quality':'observed','history':[{'date':'2026-10-26','anomalous':False}]}]}
+        result=occurrence_changes(country)
+        self.assertEqual(result['new'],1)
+        self.assertEqual(result['insufficient'],1)
+        country['stocks'][0]['history'][0]['estimated']=True
+        self.assertEqual(occurrence_changes(country)['new'],0)
+    def test_preserved_country_revision_is_not_new_collection(self):
+        from publish_views import publish
+        country={'asOf':'2026-10-27','releaseStatus':'final','schedule':{},'currency':'TWD','sampleKind':'test','coverageNote':'test','indices':[],'stocks':[],'tracked':[],'sourceRevision':'2026-10-27T10:00:00Z','lastSuccessAt':'2026-10-27T10:00:00Z'}
+        saved={}
+        manifest=publish({'generatedAt':'2026-10-28T10:00:00Z','countries':{'TW':country}},Path('/test'),lambda path,data:saved.update({str(path):data}))
+        self.assertEqual(manifest['countries']['TW']['revision'],country['sourceRevision'])
+        self.assertEqual(manifest['countries']['TW']['lastSuccessAt'],country['lastSuccessAt'])
+        self.assertEqual(saved['/test/data/countries/TW.json']['revision'],country['sourceRevision'])
+
 if __name__=='__main__':unittest.main()
