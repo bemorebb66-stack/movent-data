@@ -15,7 +15,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,7 +40,7 @@ jobs:
         run: |
           git config user.name 'movent-data-bot'
           git config user.email 'actions@users.noreply.github.com'
-          git add data/global.json data/status.json config.json requirements.txt scripts tests .gitignore README.md
+          git add data config.json requirements.txt scripts tests .gitignore README.md config.json requirements.txt scripts tests .gitignore README.md
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "data: refresh MOVENT markets $(date -u +%F)"
           git pull --rebase origin main
