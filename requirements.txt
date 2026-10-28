@@ -1,1 +1,3 @@
 exchange-calendars>=4.8,<5
+pandas>=2.2,<3
+xlrd>=2.0,<3
