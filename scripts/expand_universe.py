@@ -129,6 +129,26 @@ def taiwan():
         rows.append([code+'.TW',r.get('公司簡稱') or r['公司名稱'],sector,industry,domain(r.get('網址'))])
     return source('TW','tw-taiex','TAIEX',url,date,rows,800,'board-sample')
 
+VERIFIED_SOURCE_COMMIT='78386d91306ff89fef6c712609ab4bb81d5c5349'
+def recover_verified_sources(config,fetcher=download):
+    """Recover the published TWSE snapshot lost by a queued older config.
+
+    The pinned commit is the last verified 1,088-company public source list.
+    This is data recovery, not guessed membership or a new classification.
+    """
+    saved=config.setdefault('universeSources',{});prior=saved.get('taiwan')
+    if prior and prior.get('sourceTotal',0)>=800:return {}
+    try:
+        url='https://raw.githubusercontent.com/bemorebb66-stack/movent-data/'+VERIFIED_SOURCE_COMMIT+'/config.json'
+        baseline=json.loads(fetcher(url));candidate=baseline['universeSources']['taiwan']
+        if candidate['countryCode']!='TW' or not candidate['sourceUrl'].startswith('https://openapi.twse.com.tw/'):raise ValueError('Unexpected recovery source')
+        if any(not re.fullmatch(r'\d{4}\.TW',r[0]) for r in candidate['members']):raise ValueError('Invalid recovered ticker')
+        recovered=source('TW',candidate['slug'],candidate['name'],candidate['sourceUrl'],candidate['membershipAsOf'],candidate['members'],800,candidate['scope'])
+        saved['taiwan']=recovered
+        print('Recovered verified Taiwan source',recovered['sourceTotal'],VERIFIED_SOURCE_COMMIT,flush=True)
+        return {}
+    except Exception as error:return {'taiwan-recovery':str(error)[:200]}
+
 def expand(now=None):
     now=now or dt.datetime.now(dt.timezone.utc);path=ROOT/'config.json';config=json.loads(path.read_text());saved=config.setdefault('universeSources',{})
     providers={'nikkei':nikkei,'topix':topix,'csi300':csi300,'shenzhen':lambda:cni('399001','cn-shenzhen','선전성분',490),'chinext':lambda:cni('399006','cn-chinext','차이넥스트',95),'hsi':lambda:hsi('hsi','hk-hangseng','Hang Seng',80),'hstech':lambda:hsi('hstech','hk-hstech','Hang Seng Tech',28),'kospi200':lambda:kodex('2ETF01','kr-kospi200','코스피 200 추종 ETF 보유종목','.KS',180,now),'kosdaq150':lambda:kodex('2ETF54','kr-kosdaq150','코스닥 150 추종 ETF 보유종목','.KQ',130,now),'kospi':lambda:kind('stockMkt','.KS'),'kosdaq':lambda:kind('kosdaqMkt','.KQ'),'taiwan':taiwan}
@@ -136,7 +156,7 @@ def expand(now=None):
         key,fn=item
         try:return key,fn(),None
         except Exception as error:return key,None,str(error)[:200]
-    errors={}
+    errors=recover_verified_sources(config)
     with cf.ThreadPoolExecutor(max_workers=4) as pool:
         for key,result,error in pool.map(refresh,providers.items()):
             if result:
@@ -146,6 +166,7 @@ def expand(now=None):
             else:errors[key]=error
     for code,cfg in config['markets'].items():
         if code=='US':continue
+        if code=='TW':cfg['minimumTracked']=800
         cfg.setdefault('baseStocks',cfg['stocks']);members={r[0]:list(r)+[None]*max(0,5-len(r)) for r in cfg['baseStocks']}
         for src in saved.values():
             if src['countryCode']!=code:continue
