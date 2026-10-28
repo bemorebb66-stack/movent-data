@@ -17,6 +17,8 @@ import time
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+from html.parser import HTMLParser
+import re
 from model_v1 import sequence, context
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,13 +36,38 @@ def read_json(url):
     raise last
 
 def chart(symbol):
+    if symbol == '^TOPX': return topix_chart()
     data = read_json('https://query1.finance.yahoo.com/v8/finance/chart/' + quote(symbol, safe='') + '?range=1y&interval=1d')
     result = data.get('chart', {}).get('result')
     if not result: raise ValueError('No chart: ' + symbol)
     return result[0]
 
-def parse_bars(result, cfg, now):
-    if result.get('meta', {}).get('currency') != cfg['currency']:
+def topix_chart():
+    class TableParser(HTMLParser):
+        def __init__(self):super().__init__();self.rows=[];self.row=None;self.cell=None
+        def handle_starttag(self,tag,attrs):
+            if tag=='tr':self.row=[]
+            if tag in ('td','th') and self.row is not None:self.cell=''
+        def handle_data(self,text):
+            if self.cell is not None:self.cell+=text
+        def handle_endtag(self,tag):
+            if tag in ('td','th') and self.cell is not None:self.row.append(self.cell.strip());self.cell=None
+            if tag=='tr' and self.row is not None:self.rows.append(self.row);self.row=None
+    url='https://finance.yahoo.co.jp/quote/998405.T/history'
+    with urlopen(Request(url,headers={'User-Agent':'Mozilla/5.0'}),timeout=30) as response:html=response.read().decode('utf-8')
+    table=TableParser();table.feed(html)
+    rows={}
+    for row in table.rows:
+        if len(row)>=5 and re.fullmatch(r'\d{4}/\d{1,2}/\d{1,2}',row[0]):
+            date=dt.datetime.strptime(row[0],'%Y/%m/%d').replace(hour=9,tzinfo=ZoneInfo('Asia/Tokyo'))
+            price=float(row[4].replace(',',''))
+            if math.isfinite(price) and price>0:rows[int(date.timestamp())]=price
+    dates=sorted(rows)
+    if len(dates)<2:raise ValueError('TOPIX history unavailable')
+    return {'meta':{'currency':'JPY','instrumentType':'INDEX','source':'Yahoo Finance Japan','sourceUrl':url},'timestamp':dates,'indicators':{'quote':[{'close':[rows[d] for d in dates],'volume':[None]*len(dates)}]}}
+
+def parse_bars(result, cfg, now, require_currency=True):
+    if require_currency and result.get('meta', {}).get('currency') != cfg['currency']:
         raise ValueError('Unexpected currency')
     zone = ZoneInfo(cfg['timezone'])
     local_now = now.astimezone(zone)
@@ -50,7 +77,8 @@ def parse_bars(result, cfg, now):
         day = dt.datetime.fromtimestamp(timestamp, zone).date()
         if day > local_now.date() or day == local_now.date() and local_now.hour < cfg['finalHour']: continue
         close = quotes.get('close', [])[i]
-        volume = quotes.get('volume', [])[i]
+        volumes=quotes.get('volume') or []
+        volume = volumes[i] if i<len(volumes) else None
         if not isinstance(close, (float,int)) or not math.isfinite(close) or close <= 0: continue
         bars[day.isoformat()] = {'close':close, 'volume':volume if isinstance(volume,(float,int)) and math.isfinite(volume) and volume>0 else None}
     return bars
@@ -69,7 +97,7 @@ def schedule(cfg, now):
     return {'timezone':cfg['timezone'], 'finalHour':cfg['finalHour'], 'validFrom':start.isoformat(), 'validThrough':end.isoformat(), 'holidays':holidays}
 
 def stock_row(meta, bars, dates, code, cfg):
-    ticker, company, sector, industry = meta
+    ticker, company, sector, industry = meta[:4]
     values = [bars[d]['close']*bars[d]['volume'] if d in bars and bars[d]['volume'] else None for d in dates]
     rows = sequence(values, [False]*len(values))
     row=rows[-1]
@@ -91,7 +119,7 @@ def stock_row(meta, bars, dates, code, cfg):
       'change1d':change(1),'change5d':change(5),'change20d':change(20),'breadthCount':0,'breadthTotal':0,'breadth':0,'breadthAvailable':False,'breadthSource':'industry',
       'breadthChange5d':None,'baselineEstimated':0,'quality':'observed','sensitivity':0,'industryAvailable':False,'industryRoute':None,'sectorRoute':None,
       'countryCode':code,'currency':cfg['currency'],'exchangeCode':venue,'localCode':ticker.split('.')[0],'instrumentId':f'{code}:{venue}:{ticker}',
-      'marketCap':None,'marketCapBucket':'unknown','indexMemberships':[]}
+      'marketCap':None,'marketCapBucket':'unknown','indexMemberships':[],'logoDomain':meta[4] if len(meta)>4 else None}
 
 def validate_country(data, old=None):
     stocks=data['stocks']
@@ -121,21 +149,59 @@ def foreign_country(code, cfg, fetched, now, previous):
     if len(stocks)<max(5,math.ceil(.75*len(cfg['stocks']))):raise ValueError('Less than 75% of configured sample')
     for stock in stocks:
         peers=[s for s in stocks if s['industry']==stock['industry'] and s['ticker']!=stock['ticker']]
+        if len(peers)<5:
+            peers=[s for s in stocks if s['sector']==stock['sector'] and s['ticker']!=stock['ticker']]
+            stock['breadthSource']='sector_fallback'
         stock.update(breadthTotal=len(peers),breadthCount=sum(s['anomalous'] for s in peers),breadthAvailable=len(peers)>=5)
         stock['breadth']=round(100*stock['breadthCount']/len(peers),1) if peers else 0
     groups=lambda key:[{'slug':s[key+'Slug'],'name':s[key]} for i,s in enumerate(stocks) if s[key] not in {p[key] for p in stocks[:i]}]
     data={'asOf':dates[-1],'releaseStatus':'final','schedule':schedule(cfg,now),'currency':cfg['currency'],'sampleKind':'representative-sample','methodVersion':'v1.0','stocks':stocks,'tracked':tracked,
-          'markets':[], 'sectors':groups('sector'),'industries':groups('industry'),'indices':index_quotes(cfg,fetched,now),
+          'markets':market_groups(code,cfg,stocks), 'sectors':groups('sector'),'industries':groups('industry'),'indices':index_quotes(cfg,fetched,now),
           'coverageNote':'선정한 대표 종목의 추적 표본입니다. 국가 전체나 지수 전체 구성종목을 포괄하지 않습니다. 공식 지수 시세와 MOVENT 표본 점수는 별개입니다.'}
     return validate_country(data,previous)
+
+def market_groups(code,cfg,stocks):
+    definitions=json.loads((ROOT/'config.json').read_text()).get('marketGroups',{})
+    groups=[]
+    for slug,group in definitions.items():
+        if group['countryCode']!=code:continue
+        tracked=[s[0] for s in cfg['stocks'] if s[0] in group.get('members',[]) or group.get('suffix') and s[0].endswith(group['suffix'])]
+        constituents=[s['ticker'] for s in stocks if s['ticker'] in tracked]
+        if not constituents:continue
+        groups.append({'slug':slug,'name':group['name'],'sourceTotal':group.get('sourceTotal',len(tracked)),'constituents':constituents,'scope':group['scope'],'sourceUrl':group['sourceUrl'],'membershipAsOf':group.get('membershipAsOf')})
+    return groups
+
+def previous_exchange_session(day,cfg,now):
+    calendar=schedule(cfg,now);day=dt.date.fromisoformat(day)-dt.timedelta(days=1)
+    for _ in range(15):
+        if day.weekday()<5 and day.isoformat() not in calendar['holidays']:return day.isoformat()
+        day-=dt.timedelta(days=1)
+    raise ValueError('No verified previous exchange session')
 
 def index_quotes(cfg, fetched, now):
     results=[]
     for slug,name,symbol in cfg['indices']:
         try:
-            bars=parse_bars(fetched[symbol],cfg,now);dates=sorted(bars)
-            last=bars[dates[-1]]['close'];prev=bars[dates[-2]]['close']
-            results.append({'slug':slug,'name':name,'symbol':symbol,'date':dates[-1],'price':round(last,2),'changePct':round(100*(last/prev-1),2),'status':'ready'})
+            result=fetched[symbol];meta=result.get('meta',{})
+            bars=parse_bars(result,cfg,now,require_currency=False);dates=sorted(bars)
+            date_basis='completed-daily-bar'
+            if not dates:
+                # Some index vendors expose a live quote only. Their explicit prior
+                # close is a completed-session observation, not today's intraday price.
+                timestamps=result.get('timestamp',[])
+                if len(timestamps)!=1 or meta.get('instrumentType')!='INDEX':raise ValueError('No completed index observation')
+                local=dt.datetime.fromtimestamp(timestamps[0],ZoneInfo(cfg['timezone']))
+                if local.date()!=now.astimezone(ZoneInfo(cfg['timezone'])).date():raise ValueError('Unverified live quote date')
+                prior=meta.get('chartPreviousClose');live=meta.get('regularMarketPrice');ret=meta.get('regularMarketChangePercent')
+                if not all(isinstance(v,(int,float)) and math.isfinite(v) for v in (prior,live,ret)) or prior<=0 or abs(100*(live/prior-1)-ret)>.05:raise ValueError('Prior close validation failed')
+                dates=[previous_exchange_session(local.date().isoformat(),cfg,now)]
+                bars={dates[0]:{'close':prior,'volume':None}}
+                date_basis='vendor-previous-close-and-exchange-calendar'
+            last=bars[dates[-1]]['close']
+            prev=bars[dates[-2]]['close'] if len(dates)>1 else None
+            change=round(100*(last/prev-1),2) if isinstance(prev,(int,float)) and math.isfinite(prev) and prev>0 else None
+            meta=fetched[symbol].get('meta',{})
+            results.append({'slug':slug,'name':name,'symbol':'998405.T' if symbol=='^TOPX' else symbol,'date':dates[-1],'price':round(last,2),'changePct':change,'status':'ready','source':meta.get('source','Yahoo Finance'),'sourceUrl':meta.get('sourceUrl'),'dateBasis':date_basis})
         except Exception:
             results.append({'slug':slug,'name':name,'symbol':symbol,'date':None,'price':None,'changePct':None,'status':'unavailable'})
     return results
@@ -156,6 +222,13 @@ def us_country(cfg, fetched, now, previous):
         s.update(countryCode='US',currency='USD',companyEn=s['company'],indexMemberships=membership[s['ticker']],instrumentId='US:UNKNOWN:'+s['ticker'],exchangeCode=None,marketCap=None,marketCapBucket='unknown')
         # Country overview and stock explorer need a compact, current feed.
         s['history']=s['history'][-20:]
+    raw_by_ticker={s['t']:s for s in raw['stocks']}
+    def cap_info(ticker):
+        value=raw_by_ticker.get(ticker,{}).get('mc')
+        valid=isinstance(value,(int,float)) and math.isfinite(value) and value>0
+        return {'marketCap':value if valid else None,'marketCapBucket':'large' if valid and value>=10_000_000_000 else 'mid' if valid and value>=2_000_000_000 else 'small' if valid else 'unknown'}
+    for s in stocks:s.update(cap_info(s['ticker']))
+    for s in universe['stocks']:s.update(cap_info(s['ticker']))
     return validate_country({'asOf':payload['asOf'],'releaseStatus':payload['releaseStatus'],'schedule':schedule(cfg,now),'currency':'USD','sampleKind':'bvt-universe','methodVersion':'v1.0','stocks':stocks,'tracked':universe['stocks'],
           'markets':payload['markets'],'sectors':payload['sectors'],'industries':payload['industries'],'indices':index_quotes(cfg,fetched,now),'coverageNote':'BVT 미국 추적 유니버스. 전체 미국 상장종목을 모두 포괄하지 않습니다.'},previous)
 
@@ -186,6 +259,9 @@ def main():
         try:
             old=countries.get(code)
             countries[code]=us_country(cfg,fetched,now,old) if code=='US' else foreign_country(code,cfg,fetched,now,old)
+            if old:
+                prior={q['slug']:q for q in old.get('indices',[])}
+                countries[code]['indices']=[prior[q['slug']] if q['price'] is None and prior.get(q['slug'],{}).get('price') is not None else q for q in countries[code]['indices']]
             print(code,countries[code]['asOf'],len(countries[code]['stocks']),flush=True)
         except Exception as e:
             errors[code]=str(e)
