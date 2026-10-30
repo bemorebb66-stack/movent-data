@@ -102,7 +102,7 @@ def parse_bars(result, cfg, now, require_currency=True):
         volumes=quotes.get('volume') or []
         volume = volumes[i] if i<len(volumes) else None
         if not isinstance(close, (float,int)) or not math.isfinite(close) or close <= 0: continue
-        bars[day.isoformat()] = {'close':close, 'volume':volume if isinstance(volume,(float,int)) and math.isfinite(volume) and volume>0 else None}
+        bars[day.isoformat()] = {'open':(quotes.get('open') or [None]*len(result.get('timestamp',[])))[i], 'high':(quotes.get('high') or [None]*len(result.get('timestamp',[])))[i], 'low':(quotes.get('low') or [None]*len(result.get('timestamp',[])))[i], 'close':close, 'volume':volume if isinstance(volume,(float,int)) and math.isfinite(volume) and volume>0 else None}
     return bars
 
 def schedule(cfg, now):
@@ -137,7 +137,7 @@ def stock_row(meta, bars, dates, code, cfg):
       'dollarVolume':values[-1],'relativeActivity':round(row['ratio'],3),'ratio20':round(values[-1]/st.median(values[-21:-1]),3),'medianTurnover20':st.median(values[-21:-1]),'medianTurnover20Basis':'observed-median',
       'movent':round(row['score'],1),'activity':round(row['score'],1),'robustZ':round(row['z'],4),'baseline':round(row['baseline'],2),'anomalous':row['anomalous'],
       'persistence':round(100*count/observed,1) if observed else 0,'days5':count,'observedDays5':observed,'streak':streak,'days20':sum(bool(r and r['confirmed']) for r in rows[-20:]),
-      'history':[{'date':dates[i],'movent':round(r['score'],1),'price':bars[dates[i]]['close'],'estimated':False,'anomalous':r['confirmed']} for i,r in enumerate(rows) if r][-60:],
+      'history':[{'date':dates[i],'movent':round(r['score'],1),'price':bars[dates[i]]['close'],'estimated':False,'anomalous':r['confirmed'],'volume':bars[dates[i]].get('volume'),'open':bars[dates[i]].get('open'),'high':bars[dates[i]].get('high'),'low':bars[dates[i]].get('low'),'turnover':values[i],'ratio20':values[i]/st.median(values[i-20:i]) if i>=20 and all(values[i-20:i]) else None} for i,r in enumerate(rows) if r][-60:],
       'change1d':change(1),'change5d':change(5),'change20d':change(20),'breadthCount':0,'breadthTotal':0,'breadth':0,'breadthAvailable':False,'breadthSource':'industry',
       'breadthChange5d':None,'baselineEstimated':0,'quality':'observed','sensitivity':0,'industryAvailable':False,'industryRoute':None,'sectorRoute':None,
       'countryCode':code,'currency':cfg['currency'],'exchangeCode':venue,'localCode':ticker.split('.')[0],'instrumentId':f'{code}:{venue}:{ticker}',
@@ -323,6 +323,19 @@ def main():
         except Exception as e:
             errors[code]=str(e)
             print(code,'PRESERVED:',e,flush=True)
+    archive_at=dt.datetime.now(dt.timezone.utc).isoformat()
+    for code,cfg in CONFIG.items():
+        for meta in cfg['stocks']:
+            if meta[0] not in fetched:continue
+            try:
+                bars=parse_bars(fetched[meta[0]],cfg,now)
+                target=ROOT/'data/ohlcv'/code/(quote(meta[0],safe='')+'.json')
+                existing=json.loads(target.read_text()) if target.exists() else {'ticker':meta[0],'country':code,'observations':{}}
+                for day,bar in bars.items():
+                    versions=existing['observations'].setdefault(day,[])
+                    if not versions or versions[-1]['bar']!=bar:versions.append({'firstSeenAt':archive_at,'bar':bar})
+                atomic_write(target,existing)
+            except (ValueError,KeyError,TypeError):pass
     completed=dt.datetime.now(dt.timezone.utc).isoformat()
     status={'startedAt':now.isoformat(),'checkedAt':completed,'universeRefresh':definitions.get('universeRefresh',{}),'errors':errors,'failedSymbols':failures,'countries':{code:{'asOf':data['asOf'],'stocks':len(data['stocks'])} for code,data in countries.items()}}
     atomic_write(ROOT/'data/status.json',status)
