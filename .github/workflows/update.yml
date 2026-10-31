@@ -4,7 +4,13 @@ on:
     # Korea time 08:47 (after US close and BVT), 19:47 (after Asian closes).
     - cron: '47 23 * * *'
     - cron: '47 10 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      country:
+        description: Country to refresh (scheduled runs refresh all countries)
+        type: choice
+        default: all
+        options: [all, KR, US, JP, CN, HK, TW]
   push:
     paths: ['scripts/**', 'config.json', 'requirements.txt', 'tests/**', '.github/workflows/update.yml', 'bootstrap.py']
 permissions:
@@ -39,6 +45,8 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Collect and validate completed sessions
+        env:
+          MOVENT_COUNTRIES: ${{ github.event.inputs.country != 'all' && github.event.inputs.country || '' }}
         run: python scripts/update.py
       - name: Publish validated feed
         run: |

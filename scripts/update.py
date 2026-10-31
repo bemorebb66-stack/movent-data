@@ -166,11 +166,31 @@ def unavailable_reason(bars,dates,currency):
         return f'직전 60거래일 중앙 거래대금이 최소 조건 {MIN_LIQUIDITY:,.0f} {currency} 미만입니다.'
     return '가격·거래량 관측값이 계산 검증을 통과하지 못했습니다.'
 
+def completed_session_dates(cfg, now, start):
+    """Use exchange sessions, independently of missing benchmark index quotes."""
+    local = now.astimezone(ZoneInfo(cfg['timezone']))
+    end = local.date()
+    if local.hour < cfg['finalHour']:
+        end -= dt.timedelta(days=1)
+    calendars = {year: schedule(cfg, dt.datetime(year, 7, 1, tzinfo=dt.timezone.utc)) for year in range(dt.date.fromisoformat(start).year, end.year + 1)}
+    dates = []
+    day = dt.date.fromisoformat(start)
+    while day <= end:
+        key = day.isoformat()
+        cal = calendars[day.year]
+        if not cal['validFrom'] <= key <= cal['validThrough']:
+            raise ValueError('Exchange calendar outside validated coverage')
+        if day.weekday() < 5 and key not in cal['holidays']:
+            dates.append(key)
+        day += dt.timedelta(days=1)
+    return dates
+
 def foreign_country(code, cfg, fetched, now, previous):
     if len(cfg['stocks'])<cfg.get('minimumTracked',0):raise ValueError('Tracking universe below validated minimum; preserve last good country')
-    # The broad market index supplies an independent local session grid.
+    # Index quote availability must not truncate otherwise completed stock sessions.
     reference=parse_bars(fetched[cfg['indices'][0][2]], cfg, now)
-    dates=sorted(reference)
+    if not reference:raise ValueError('No reference history for baseline start')
+    dates=completed_session_dates(cfg, now, min(reference))
     if len(dates)<81:raise ValueError('Insufficient reference sessions')
     stocks=[];tracked=[]
     for meta in cfg['stocks']:
@@ -289,8 +309,14 @@ def atomic_write(path, data):
 def main():
     global CONFIG
     now=dt.datetime.now(dt.timezone.utc)
-    from expand_universe import expand
-    CONFIG=expand(now)['markets']
+    selected={c.strip().upper() for c in os.environ.get('MOVENT_COUNTRIES','').split(',') if c.strip()}
+    if selected:
+        definitions=json.loads((ROOT/'config.json').read_text())
+        if selected-set(definitions['markets']):raise ValueError('Unknown selected country')
+        CONFIG={c:cfg for c,cfg in definitions['markets'].items() if c in selected}
+    else:
+        from expand_universe import expand
+        CONFIG=expand(now)['markets']
     path=ROOT/'data/global.json'
     previous=json.loads(path.read_text()) if path.exists() else {'countries':{}}
     symbols={s[0] for cfg in CONFIG.values() for s in cfg['stocks']} | {i[2] for cfg in CONFIG.values() for i in cfg['indices']}
