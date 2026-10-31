@@ -1,1 +1,1 @@
-{"ticker":"439270.KQ","country":"KR","observations":{"2026-10-30":[{"firstSeenAt":"2026-10-30T16:57:03.039265+00:00","bar":{"open":12000.0,"high":12700.0,"low":9360.0,"close":9360.0,"volume":14956873}}]}}
+{"ticker":"439270.KQ","country":"KR","observations":{"2026-10-30":[{"firstSeenAt":"2026-10-30T16:57:03.039265+00:00","bar":{"open":12000.0,"high":12700.0,"low":9360.0,"close":9360.0,"volume":14956873}},{"firstSeenAt":"2026-10-31T00:57:48.656716+00:00","bar":{"open":12000.0,"high":12700.0,"low":9360.0,"close":9360.0,"volume":15995746}}]}}
