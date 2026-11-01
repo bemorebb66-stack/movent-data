@@ -1,0 +1,39 @@
+name: Update MOVENT crypto
+on:
+  schedule:
+    # Funding-time grid: UTC 00/08/16, KST 09:00/17:00/01:00.
+    - cron: '0 0,8,16 * * *'
+  workflow_dispatch:
+  push:
+    paths: ['scripts/crypto.py', 'tests/test_crypto.py', '.github/workflows/crypto.yml']
+permissions:
+  contents: write
+concurrency:
+  group: movent-crypto-data
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sync latest baseline
+        run: git pull --ff-only origin main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify closed-bar rules
+        run: python -m unittest discover -s tests -p test_crypto.py -v
+      - name: Collect BTC and ETH
+        id: collect
+        run: python scripts/crypto.py
+      - name: Persist verified data and collection status
+        if: always() && steps.collect.outcome != 'skipped'
+        run: |
+          git config user.name 'movent-data-bot'
+          git config user.email 'actions@users.noreply.github.com'
+          git add data/crypto
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "data: refresh BTC and ETH 8-hour observations"
+          git pull --rebase -X theirs origin main
+          git push origin HEAD:main

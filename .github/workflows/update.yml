@@ -1,9 +1,14 @@
 name: Update MOVENT markets
 on:
   schedule:
-    # Korea time 08:47 (after US close and BVT), 19:47 (after Asian closes).
-    - cron: '47 23 * * *'
-    - cron: '47 10 * * *'
+    # Primary starts: Asia 17:00 KST, US 07:00 KST (fixed Korean time).
+    - cron: '0 8 * * *'
+    - cron: '0 22 * * *'
+    # Retry only missing/failed markets, 30 and 60 minutes after primary.
+    - cron: '30 8 * * *'
+    - cron: '0 9 * * *'
+    - cron: '30 22 * * *'
+    - cron: '0 23 * * *'
   workflow_dispatch:
     inputs:
       country:
@@ -12,7 +17,7 @@ on:
         default: all
         options: [all, KR, US, JP, CN, HK, TW]
   push:
-    paths: ['scripts/**', 'config.json', 'requirements.txt', 'tests/**', '.github/workflows/update.yml', 'bootstrap.py']
+    paths: ['scripts/**', '!scripts/crypto.py', '!tests/test_crypto.py', 'config.json', 'requirements.txt', 'tests/**', '.github/workflows/update.yml', 'bootstrap.py']
 permissions:
   contents: write
 concurrency:
@@ -35,9 +40,17 @@ jobs:
         run: python bootstrap.py
       - name: Install exchange calendars
         run: pip install -r requirements.txt
+      - name: Select scheduled markets
+        id: select
+        env:
+          MOVENT_EVENT: ${{ github.event_name }}
+          MOVENT_CRON: ${{ github.event.schedule }}
+          MOVENT_COUNTRY: ${{ github.event.inputs.country || 'all' }}
+        run: python scripts/collection_schedule.py
       - name: Test calculation and preservation rules
         run: python -m unittest discover -s tests -v
       - name: Read BVT source
+        if: steps.select.outputs.countries != 'none'
         uses: actions/checkout@v4
         with:
           repository: bemorebb66-stack/bmo-moneyflow
@@ -45,10 +58,13 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Collect and validate completed sessions
+        if: steps.select.outputs.countries != 'none'
         env:
-          MOVENT_COUNTRIES: ${{ github.event.inputs.country != 'all' && github.event.inputs.country || '' }}
+          MOVENT_COUNTRIES: ${{ steps.select.outputs.countries }}
+          MOVENT_REFRESH_UNIVERSE: ${{ github.event.schedule == '0 8 * * *' && '1' || '0' }}
         run: python scripts/update.py
       - name: Publish validated feed
+        if: steps.select.outputs.countries != 'none'
         run: |
           git config user.name 'movent-data-bot'
           git config user.email 'actions@users.noreply.github.com'

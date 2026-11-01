@@ -25,7 +25,10 @@ import threading
 from model_v1 import sequence, context, MIN_LIQUIDITY
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / 'config.json').read_text())['markets']
+COLLECTION_FINAL_HOURS = {'US':17, 'KR':17, 'JP':17, 'CN':16, 'HK':16, 'TW':16}
+def collection_config(markets):
+    return {code:{**cfg, 'finalHour':COLLECTION_FINAL_HOURS[code], 'finalMinute':10 if code=='HK' else 0} for code,cfg in markets.items()}
+CONFIG = collection_config(json.loads((ROOT / 'config.json').read_text())['markets'])
 _rate_lock=threading.Lock()
 _next_request=0.0
 
@@ -97,7 +100,7 @@ def parse_bars(result, cfg, now, require_currency=True):
     bars = {}
     for i, timestamp in enumerate(result.get('timestamp', [])):
         day = dt.datetime.fromtimestamp(timestamp, zone).date()
-        if day > local_now.date() or day == local_now.date() and local_now.hour < cfg['finalHour']: continue
+        if day > local_now.date() or day == local_now.date() and (local_now.hour*60+local_now.minute) < cfg['finalHour']*60+cfg.get('finalMinute',0): continue
         close = quotes.get('close', [])[i]
         volumes=quotes.get('volume') or []
         volume = volumes[i] if i<len(volumes) else None
@@ -116,7 +119,7 @@ def schedule(cfg, now):
     while day <= end:
         if day.weekday()<5 and day.isoformat() not in sessions: holidays.append(day.isoformat())
         day+=dt.timedelta(days=1)
-    return {'timezone':cfg['timezone'], 'finalHour':cfg['finalHour'], 'validFrom':start.isoformat(), 'validThrough':end.isoformat(), 'holidays':holidays}
+    return {'timezone':cfg['timezone'], 'finalHour':cfg['finalHour'], 'finalMinute':cfg.get('finalMinute',0), 'validFrom':start.isoformat(), 'validThrough':end.isoformat(), 'holidays':holidays}
 
 def stock_row(meta, bars, dates, code, cfg):
     ticker, company, sector, industry = meta[:4]
@@ -170,7 +173,7 @@ def completed_session_dates(cfg, now, start):
     """Use exchange sessions, independently of missing benchmark index quotes."""
     local = now.astimezone(ZoneInfo(cfg['timezone']))
     end = local.date()
-    if local.hour < cfg['finalHour']:
+    if local.hour*60+local.minute < cfg['finalHour']*60+cfg.get('finalMinute',0):
         end -= dt.timedelta(days=1)
     calendars = {year: schedule(cfg, dt.datetime(year, 7, 1, tzinfo=dt.timezone.utc)) for year in range(dt.date.fromisoformat(start).year, end.year + 1)}
     dates = []
@@ -312,11 +315,15 @@ def main():
     selected={c.strip().upper() for c in os.environ.get('MOVENT_COUNTRIES','').split(',') if c.strip()}
     if selected:
         definitions=json.loads((ROOT/'config.json').read_text())
+        if os.environ.get('MOVENT_REFRESH_UNIVERSE')=='1':
+            from expand_universe import expand
+            definitions=expand(now)
         if selected-set(definitions['markets']):raise ValueError('Unknown selected country')
         CONFIG={c:cfg for c,cfg in definitions['markets'].items() if c in selected}
     else:
         from expand_universe import expand
         CONFIG=expand(now)['markets']
+    CONFIG=collection_config(CONFIG)
     path=ROOT/'data/global.json'
     previous=json.loads(path.read_text()) if path.exists() else {'countries':{}}
     symbols={s[0] for cfg in CONFIG.values() for s in cfg['stocks']} | {i[2] for cfg in CONFIG.values() for i in cfg['indices']}
@@ -339,7 +346,11 @@ def main():
     for code,cfg in CONFIG.items():
         try:
             old=countries.get(code)
-            countries[code]=us_country(cfg,fetched,now,old) if code=='US' else foreign_country(code,cfg,fetched,now,old)
+            candidate=us_country(cfg,fetched,now,old) if code=='US' else foreign_country(code,cfg,fetched,now,old)
+            local_day=now.astimezone(ZoneInfo(cfg['timezone'])).date()
+            expected=completed_session_dates(cfg,now,(local_day-dt.timedelta(days=14)).isoformat())[-1]
+            if candidate['asOf'] < expected:raise ValueError('Latest completed session not yet available: '+expected)
+            countries[code]=candidate
             countries[code]['lastSuccessAt']=dt.datetime.now(dt.timezone.utc).isoformat()
             countries[code]['sourceRevision']=countries[code]['lastSuccessAt']
             if old:
